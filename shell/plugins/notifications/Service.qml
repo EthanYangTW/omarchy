@@ -19,6 +19,14 @@ Item {
 
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   readonly property string home: Quickshell.env("HOME")
+  // The click token omarchy-notification-send mints once per login (see
+  // NotificationLogic.execArgvFromHints). It lives in XDG_RUNTIME_DIR, which a
+  // sandboxed notification sender cannot reach, so a hint that matches it came
+  // from this session. Read on demand rather than at startup: the file only
+  // exists once a sender has used --exec, which can be after the shell is up.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string execTokenPath: runtimeDir ? runtimeDir + "/omarchy-notification-exec-token" : ""
+  property string execToken: ""
   // History + DND live under XDG_STATE_HOME: they're persistent user state
   // (the notifications received, the last-set DND preference), not
   // regeneratable cache that a `rm -rf ~/.cache` should wipe.
@@ -136,7 +144,40 @@ Item {
   }
 
   function snapshotOf(notification) {
-    return NotificationLogic.snapshotOf(notification, Date.now())
+    return NotificationLogic.snapshotOf(notification, Date.now(), execTokenFor(notification))
+  }
+
+  // The token this notification's click command must carry. A login session
+  // keeps one token, so the cached reading answers every later toast; the file
+  // is (re)read only when a toast carries a token hint the cache does not
+  // match — the first --exec after shell start, or a forged hint, and one read
+  // tells which. A toast with no token hint never costs a read: without one
+  // its click command is dropped whatever the file says.
+  function execTokenFor(notification) {
+    var hints = null
+    try {
+      hints = notification ? notification.hints : null
+    } catch (e) {
+      hints = null
+    }
+    var hint = NotificationLogic.stringHint(hints, "omarchy-exec-token")
+    if (!hint || hint === service.execToken || !service.execTokenPath) return service.execToken
+
+    // reload() reads in the background even with blockLoading, so wait for
+    // it: text() would otherwise still hold the previous reading.
+    execTokenFile.reload()
+    execTokenFile.waitForJob()
+    var token = String(execTokenFile.text() || "").trim()
+    if (/^[0-9a-f]{64}$/.test(token)) service.execToken = token
+    return service.execToken
+  }
+
+  FileView {
+    id: execTokenFile
+    path: service.execTokenPath
+    blockLoading: true
+    watchChanges: false
+    printErrors: false
   }
 
   // A notification nobody looks back at:
@@ -211,7 +252,7 @@ Item {
     writeHistoryFile(written, function() {
       var updated = null
       try {
-        updated = NotificationLogic.replacementSnapshot(notification, written.originalId, written.timestamp)
+        updated = NotificationLogic.replacementSnapshot(notification, written.originalId, written.timestamp, service.execTokenFor(notification))
       } catch (e) {
         // Torn down by the server while the write was queued.
       }
@@ -265,7 +306,7 @@ Item {
 
     var updated
     try {
-      updated = NotificationLogic.replacementSnapshot(notification, originalId, timestamp)
+      updated = NotificationLogic.replacementSnapshot(notification, originalId, timestamp, service.execTokenFor(notification))
     } catch (e) {
       // Object torn down by the server while the signal was in flight.
       return
@@ -319,7 +360,7 @@ Item {
   // while its insert was deferred, and the snapshot still holds the original.
   function currentContent(notification, snapshot) {
     try {
-      return NotificationLogic.replacementSnapshot(notification, snapshot.originalId, snapshot.timestamp)
+      return NotificationLogic.replacementSnapshot(notification, snapshot.originalId, snapshot.timestamp, service.execTokenFor(notification))
     } catch (e) {
       // Torn down by the server meanwhile — the snapshot is all there is.
       return snapshot

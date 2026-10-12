@@ -73,6 +73,7 @@ flags map onto that call:
 |---|---|---|
 | `-g` / `--glyph` | hint `omarchy-glyph` | Nerd Font glyph for the icon slot when no image icon resolves |
 | `--exec <program> [args…]` | hint `omarchy-exec-argv` | the click command; consumes the rest of the line, so it comes last. Each word is a discrete argument the shell runs without re-parsing (see below) |
+| (with `--exec`) | hint `omarchy-exec-token` | the per-login token that proves the sender belongs to this session; the shell drops the click command of any toast whose token does not match (see below) |
 | `--image` | hint `image-path` | the standard freedesktop image hint |
 | `-i` / `--icon` | `app_icon` | themed icon name for the toast |
 | `--app-name` | `app_name` | defaults to `omarchy-action` |
@@ -130,11 +131,29 @@ strings whose program is present and not a leading-dash option) rather than
 running anything it can't validate. A caller can still deliberately name a shell
 as the program (`--exec sh -c …`), but that runs code because the *developer*
 wrote it, not because attacker data became a command — a reviewable red flag
-(greppable as `--exec sh`/`--exec bash`), not an injection. Insulating against a
-native same-user process is out of scope: it already runs with your privileges
-and needs no notification to execute code. What is fully closed is untrusted
-*content* — web notifications can't set the exec hint at all, and any relayed
-title/filename is confined to inert argument data.
+(greppable as `--exec sh`/`--exec bash`), not an injection. What is fully closed
+is untrusted *content* — web notifications can't set the exec hint at all, and
+any relayed title/filename is confined to inert argument data.
+
+### Only this session's senders get a click command
+
+Hints are not an identity. Any client on the session bus can set
+`omarchy-exec-argv` — the freedesktop protocol gives the sender every hint — and
+that includes sandboxed apps that are allowed to talk to
+`org.freedesktop.Notifications` (most Flatpak browsers and chat clients are). A
+well-formed argv from such an app would run outside its sandbox on one click,
+looking exactly like an Omarchy toast. So the argv hint counts only with a
+matching `omarchy-exec-token`: a 32-byte random token the sender mints once per
+login as `$XDG_RUNTIME_DIR/omarchy-notification-exec-token`, mode 0600, claimed
+with `link(2)` so concurrent first senders agree on one token. A sandbox gets a
+private runtime directory and never sees that file. The shell reads the same
+file (lazily, since the first `--exec` can come after the shell is up, and again
+only when a hint disagrees with its cached reading) and keeps the click command
+only when the two match; otherwise the toast shows with no click command and
+the restored copy carries none either. `--exec` with no runtime directory is
+refused outright rather than sent as a command the shell would drop. A native,
+unsandboxed same-user process can read the token, and that is the boundary:
+it already runs with your privileges and needs no notification to execute code.
 
 The sender keeps that last part true structurally rather than leaving it to each
 caller. Because it calls `Notify` directly, the headline and description are

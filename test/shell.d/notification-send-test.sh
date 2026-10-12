@@ -24,8 +24,15 @@ printf '%s\n' '#!/bin/bash' 'echo "notify-send was invoked" >"$OMARCHY_TEST_NOTI
 chmod +x "$tmpdir/notify-send"
 tripwire="$tmpdir/notify-send-was-used"
 
+# A private runtime dir: --exec mints its click token there. A test that needs
+# the sender to run without one sets send_runtime_dir to the empty string.
+runtime_dir="$tmpdir/run"
+mkdir -m 700 "$runtime_dir"
+send_runtime_dir=$runtime_dir
+
 send() {
   OMARCHY_TEST_BUSCTL_ARGS="$args_file" OMARCHY_TEST_NOTIFY_TRIPWIRE="$tripwire" \
+    XDG_RUNTIME_DIR="$send_runtime_dir" \
     PATH="$tmpdir:$ROOT/bin:$PATH" omarchy-notification-send "$@"
 }
 
@@ -106,8 +113,58 @@ pass "notification wrapper accepts the --flag=value form"
 send "Plain" >/dev/null
 load
 has_hint omarchy-exec-argv && fail "notification wrapper adds no click hint without --exec"
+has_hint omarchy-exec-token && fail "notification wrapper adds no click token without --exec"
 [[ ${args[11]} == "Plain" ]] || fail "notification wrapper still sends a plain toast"
-pass "notification wrapper omits the click hint when no command is given"
+pass "notification wrapper omits the click hint and token when no command is given"
+
+# ---------------------------------------------------------------- click token
+# The click argv is honored by the shell only with the per-login token minted
+# under XDG_RUNTIME_DIR, so any sandboxed app that can reach the notification
+# bus but not that directory cannot hand the shell a command to run.
+token_file="$runtime_dir/omarchy-notification-exec-token"
+: >"$args_file"
+send "Head" --exec mpv -- /tmp/v.mp4 >/dev/null
+load
+token=$(hint_value omarchy-exec-token) || fail "notification wrapper sends the click token with --exec"
+[[ $token =~ ^[0-9a-f]{64}$ ]] || fail "the click token is 32 random bytes as hex" "$token"
+[[ -f $token_file && ! -L $token_file ]] || fail "the click token is minted as a regular file in XDG_RUNTIME_DIR"
+[[ $(stat -c %a "$token_file") == 600 ]] || fail "the click token file is private" "$(stat -c %a "$token_file")"
+[[ $(<"$token_file") == "$token" ]] || fail "the click token hint is the token file's content"
+pass "notification wrapper mints a private per-login click token and sends it with --exec"
+
+: >"$args_file"
+send "Again" --exec mpv -- /tmp/w.mp4 >/dev/null
+load
+[[ $(hint_value omarchy-exec-token) == "$token" ]] || fail "a second --exec reuses the minted token" "$(hint_value omarchy-exec-token)"
+leftovers=("$runtime_dir"/omarchy-notification-exec-token.*)
+[[ ! -e ${leftovers[0]} ]] || fail "minting leaves no staging file behind" "${leftovers[*]}"
+pass "notification wrapper reuses the login session's click token"
+
+# Without a runtime dir there is nowhere a sandbox cannot see, so --exec is
+# refused outright rather than sent as a click command the shell would drop.
+if send_runtime_dir="" send "Head" --exec mpv -- /tmp/v.mp4 2>/dev/null; then
+  fail "notification wrapper refuses --exec without XDG_RUNTIME_DIR"
+fi
+: >"$args_file"
+send_runtime_dir="" send "Plain" >/dev/null
+load
+[[ ${args[11]} == "Plain" ]] || fail "a toast without --exec still sends without XDG_RUNTIME_DIR"
+pass "notification wrapper refuses --exec without a runtime dir but still sends plain toasts"
+
+# A token file that is not the sender's own regular file is never read as a
+# token, whichever way it got there.
+rm -f -- "$token_file"
+ln -s /etc/hostname "$token_file"
+if send "Head" --exec mpv -- /tmp/v.mp4 2>/dev/null; then
+  fail "notification wrapper refuses a symlinked click token file"
+fi
+rm -f -- "$token_file"
+printf 'not a token\n' >"$token_file"
+if send "Head" --exec mpv -- /tmp/v.mp4 2>/dev/null; then
+  fail "notification wrapper refuses a click token file with unexpected content"
+fi
+rm -f -- "$token_file"
+pass "notification wrapper refuses a click token it did not mint"
 
 # ------------------------------------------------ rest-of-line --exec is literal
 : >"$args_file"

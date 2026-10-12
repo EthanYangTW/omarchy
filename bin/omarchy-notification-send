@@ -146,9 +146,53 @@ critical) urgency_byte=2 ;;
   ;;
 esac
 
+# The shell runs the click argv as this user, so the hint has to prove it came
+# from this login session and not from just any client on the session bus: a
+# sandboxed app allowed to talk to org.freedesktop.Notifications sets hints as
+# freely as we do, and nothing else about a Notify call says who sent it. The
+# proof is a per-login token under XDG_RUNTIME_DIR, which such a sandbox never
+# sees; the shell reads the same file and drops the click command of any toast
+# whose omarchy-exec-token hint disagrees with it (see docs/notifications.md).
+exec_token_file() {
+  local dir=${XDG_RUNTIME_DIR:-}
+  if [[ -z $dir || -L $dir || ! -d $dir || ! -O $dir ]]; then
+    echo "--exec needs XDG_RUNTIME_DIR (a directory you own) to hold the click token" >&2
+    return 1
+  fi
+  printf '%s\n' "$dir/omarchy-notification-exec-token"
+}
+
+exec_token() {
+  local file staged token
+  file=$(exec_token_file) || return 1
+
+  if [[ ! -e $file ]]; then
+    # mktemp creates the staging file 0600, and link(2) refuses an existing
+    # name, so two senders minting at once both read whichever token landed.
+    staged=$(mktemp -- "$file.XXXXXX") || return 1
+    if ! od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$staged"; then
+      rm -f -- "$staged"
+      return 1
+    fi
+    ln -- "$staged" "$file" 2>/dev/null || true
+    rm -f -- "$staged"
+  fi
+
+  if [[ -L $file || ! -f $file || ! -O $file ]]; then
+    echo "Refusing the click token at $file: not a regular file you own" >&2
+    return 1
+  fi
+  token=$(<"$file")
+  if [[ ! $token =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Refusing the click token at $file: unexpected content" >&2
+    return 1
+  fi
+  printf '%s\n' "$token"
+}
+
 # a{sv} hints, as busctl triples (key, variant type, value). urgency is a byte;
-# the rest are strings. The click command rides here as omarchy-exec-argv, built
-# only from --exec below.
+# the rest are strings. The click command rides here as omarchy-exec-argv with
+# its omarchy-exec-token, both built only from --exec below.
 hints=(urgency y "$urgency_byte")
 
 if [[ -n $glyph ]]; then
@@ -176,7 +220,8 @@ if ((exec_present)); then
   # NUL-delimit into jq so every byte survives as data: jq's own --args would eat
   # a bare "--", and a newline in an arg must not split the vector.
   exec_argv_json=$(printf '%s\0' "${exec_args[@]}" | jq -Rsc 'split("\u0000")[:-1]')
-  hints+=(omarchy-exec-argv s "$exec_argv_json")
+  exec_token_value=$(exec_token) || exit 1
+  hints+=(omarchy-exec-argv s "$exec_argv_json" omarchy-exec-token s "$exec_token_value")
 fi
 
 hint_count=$((${#hints[@]} / 3))
